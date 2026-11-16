@@ -14,14 +14,29 @@ venv/
 .env.*
 !.env.example
 .streamlit/secrets.toml
+.streamlit/credentials.toml
+config.local.*
+settings.local.*
 
 # Local databases and backups; keep the original files on disk, out of Git
 *.db
 *.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 backups/
 
 # Trained model binaries are reproducible from the included training code
 models/*.pkl
+models/*.joblib
+
+# Temporary files and local logs
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
 
 # OS-generated files and the known incomplete placeholder
 Thumbs.db
