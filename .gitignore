@@ -1,0 +1,29 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python environments
+venv/
+.venv/
+
+# Local secrets and Streamlit credentials
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local databases and backups; keep the original files on disk, out of Git
+*.db
+*.db-*
+backups/
+
+# Trained model binaries are reproducible from the included training code
+models/*.pkl
+
+# OS-generated files and the known incomplete placeholder
+Thumbs.db
+.DS_Store
+u.pdf
