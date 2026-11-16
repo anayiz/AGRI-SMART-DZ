@@ -10,10 +10,13 @@ AI-powered agricultural market intelligence for Algeria.
 - Isolation Forest anomaly detection over the recent 90-day window
 - Smart alert generation and manual data entry for stock/price updates
 - Interactive Streamlit dashboard for presentation and demo use
+- Ten sidebar sections for the dashboard, forecasts, stock, shortage risk, anomalies, regional analysis, scenarios, alerts, reports, and project information
 - Dashboard snapshots for the July 2026 demo scenario and latest available data
 - Arabic/French dashboard with right-to-left layout for Arabic
 - What-if supply scenario estimates for 7- and 30-day prices
 - Approximate city-level market map for the demo regions
+- CSV exports for the market dataset and current rule-based alerts
+- Manual price and stock entry under Stock Monitoring
 
 ## Setup (Windows PowerShell)
 ```powershell
@@ -31,6 +34,10 @@ sidebar to switch to French, select the latest available snapshot, or focus on
 a region. The July scenario highlights price pressure in Alger, a stock decline
 in Oran, and combined pressure in Constantine. Forecasts use the latest date in
 the dataset, even when viewing the historical scenario.
+
+Use the sidebar navigation to switch between the ten sections. The Reports
+section exports CSV files only; forecast target dates are anchored to the last
+available dataset date and may be stale if the dataset is not updated.
 
 The what-if panel changes the latest observed stock input and runs the trained
 price models again. Treat its output as an illustrative sensitivity test, not a

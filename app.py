@@ -31,6 +31,18 @@ ALERT_COLUMNS = [
     "price_change_pct",
     "stock_ratio",
 ]
+NAVIGATION_SECTIONS = (
+    ("dashboard", "Dashboard"),
+    ("price_prediction", "Price Prediction"),
+    ("stock_monitoring", "Stock Monitoring"),
+    ("shortage_detection", "Shortage Detection"),
+    ("anomaly_detection", "Anomaly Detection"),
+    ("regional_analysis", "Regional Market Analysis"),
+    ("what_if", "What-if Simulation"),
+    ("smart_alerts", "Smart Alerts"),
+    ("reports", "Reports"),
+    ("about", "About AGRI-SMART DZ"),
+)
 
 
 st.set_page_config(
@@ -62,6 +74,16 @@ def select_language():
             unsafe_allow_html=True,
         )
     return language
+
+
+def select_section():
+    labels = dict(NAVIGATION_SECTIONS)
+    return st.sidebar.radio(
+        tr("Navigation"),
+        list(labels),
+        format_func=lambda section: tr(labels[section]),
+        label_visibility="collapsed",
+    )
 
 
 def ensure_demo_data():
@@ -243,16 +265,10 @@ def render_kpis(clean_df, alert_df, anomalies_df, snapshot_date):
     st.caption(tr("Regional metrics are the latest observations on or before {date}.", date=f"{snapshot_date:%d %b %Y}"))
 
 
-def render_charts(snapshot_df, predictions, latest_df):
-    regions = sorted(snapshot_df["region"].unique())
+def render_dashboard_charts(snapshot_df):
     focus_regions = ["Alger", "Oran", "Constantine"]
+    regions = set(snapshot_df["region"].unique())
     comparison_regions = [region for region in focus_regions if region in regions]
-    region = st.sidebar.selectbox(
-        tr("Focus region"),
-        regions,
-        index=regions.index("Alger") if "Alger" in regions else 0,
-        format_func=region_label,
-    )
     compare = snapshot_df[snapshot_df["region"].isin(comparison_regions)].copy()
     compare["region_display"] = compare["region"].map(region_label)
     fig_price = px.line(
@@ -279,6 +295,36 @@ def render_charts(snapshot_df, predictions, latest_df):
     charts_left.plotly_chart(fig_price, use_container_width=True)
     charts_right.plotly_chart(fig_stock, use_container_width=True)
 
+
+def render_stock_monitoring(snapshot_df):
+    region_summary = snapshot_df.sort_values("date").groupby("region").tail(1).sort_values("stock")
+    region_summary["region_label"] = region_summary["region"].map(region_label)
+    fig = px.bar(
+        region_summary,
+        x="region_label",
+        y="stock",
+        color="stock",
+        title=tr("Latest regional stock comparison"),
+        template="plotly_white",
+        labels={"region_label": tr("region"), "stock": tr("Stock")},
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(
+        region_summary[["region_label", "date", "stock", "data_source"]].rename(
+            columns={
+                "region_label": tr("region"),
+                "date": tr("Date"),
+                "stock": tr("Stock"),
+                "data_source": tr("data_source"),
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    render_manual_inputs(snapshot_df)
+
+
+def render_regional_market(snapshot_df):
     region_summary = snapshot_df.sort_values("date").groupby("region").tail(1).sort_values("price")
     region_summary["region_label"] = region_summary["region"].map(region_label)
     fig_region = px.bar(
@@ -323,6 +369,15 @@ def render_charts(snapshot_df, predictions, latest_df):
     st.plotly_chart(map_figure, use_container_width=True)
     st.caption(tr("Approximate city coordinates only; markers are not wilaya boundaries."))
 
+
+def render_price_prediction(predictions, latest_df):
+    regions = sorted(latest_df["region"].unique())
+    region = st.selectbox(
+        tr("Focus region"),
+        regions,
+        index=regions.index("Alger") if "Alger" in regions else 0,
+        format_func=region_label,
+    )
     horizon = st.selectbox(
         tr("Forecast horizon"),
         dp.HORIZONS,
@@ -353,7 +408,7 @@ def render_charts(snapshot_df, predictions, latest_df):
     st.plotly_chart(pred_fig, use_container_width=True)
 
 
-def render_alerts(alert_df, anomalies_df):
+def render_shortage_detection(alert_df):
     st.subheader(tr("Shortage risk overview"))
     if alert_df.empty:
         st.info(tr("No regional shortage alerts were generated for this snapshot."))
@@ -368,6 +423,8 @@ def render_alerts(alert_df, anomalies_df):
                 unsafe_allow_html=True,
             )
 
+
+def render_anomaly_detection(anomalies_df):
     st.subheader(tr("Detected anomalies requiring verification"))
     st.info(tr(
         "Supply-chain discrepancy checks need verified production, warehouse-release, and wholesale-market volume data, which this demo does not contain."
@@ -376,6 +433,57 @@ def render_alerts(alert_df, anomalies_df):
         st.success(tr("No unusual patterns detected in the current data window."))
     else:
         st.dataframe(anomalies_df.rename(columns={column: tr(column) for column in anomalies_df.columns}), use_container_width=True)
+
+
+def render_smart_alerts(alert_df):
+    st.subheader(tr("Smart Alerts"))
+    st.caption(tr("Alerts are rule-based signals generated from the selected synthetic-data snapshot."))
+    if alert_df.empty:
+        st.info(tr("No regional shortage alerts were generated for this snapshot."))
+        return
+    display = alert_df.copy()
+    display["region"] = display["region"].map(region_label)
+    st.dataframe(
+        display.rename(columns={column: tr(column) for column in display.columns}),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_reports(clean_df, alert_df):
+    st.subheader(tr("Reports"))
+    latest_date = clean_df["date"].max()
+    st.caption(
+        tr("Data source: {source} · last available observation: {date}",
+           source=clean_df["data_source"].mode().iat[0],
+           date=latest_date.strftime("%Y-%m-%d"))
+    )
+    st.warning(tr("Exported values retain their dataset source labels; synthetic data is not verified market data."))
+    st.download_button(
+        tr("Download market dataset (CSV)"),
+        data=clean_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="agri_smart_market_data.csv",
+        mime="text/csv",
+    )
+    if not alert_df.empty:
+        st.download_button(
+            tr("Download current alerts (CSV)"),
+            data=alert_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="agri_smart_alerts.csv",
+            mime="text/csv",
+        )
+
+
+def render_about(clean_df):
+    st.subheader(tr("About AGRI-SMART DZ"))
+    st.write(tr("About project description"))
+    st.write(tr("About model description"))
+    st.write(tr("About limitations"))
+    st.caption(
+        tr("Data source: {source} · last available observation: {date}",
+           source=clean_df["data_source"].mode().iat[0],
+           date=clean_df["date"].max().strftime("%Y-%m-%d"))
+    )
 
 
 def render_scenario_simulator(clean_df, predictions):
@@ -450,12 +558,16 @@ def render_manual_inputs(clean_df):
 
 def main():
     select_language()
+    section = select_section()
     ensure_demo_data()
     clean_df = load_dashboard_data()
     snapshot_df, is_scenario = select_snapshot(clean_df)
-    predictions = get_model_predictions(clean_df)
     alert_df = build_alerts(snapshot_df)
-    anomalies_df = detect_anomalies(snapshot_df)
+    anomalies_df = (
+        detect_anomalies(snapshot_df)
+        if section in {"dashboard", "anomaly_detection"}
+        else pd.DataFrame()
+    )
     snapshot_date = snapshot_df["date"].max()
 
     st.title("AGRI-SMART DZ")
@@ -480,24 +592,40 @@ def main():
             get_model_predictions.clear()
             st.success(tr("Models retrained and saved."))
 
-    render_kpis(snapshot_df, alert_df, anomalies_df, snapshot_date)
-    overview_tab, alerts_tab, simulator_tab, update_tab = st.tabs(
-        [tr("Market overview"), tr("Alerts & verification"), tr("What-if simulator"), tr("Manual update")]
+    predictions = (
+        get_model_predictions(clean_df)
+        if section in {"price_prediction", "what_if"}
+        else None
     )
-    with overview_tab:
-        render_charts(snapshot_df, predictions, clean_df)
-    with alerts_tab:
-        render_alerts(alert_df, anomalies_df)
-    with simulator_tab:
-        render_scenario_simulator(clean_df, predictions)
-    with update_tab:
-        render_manual_inputs(clean_df)
 
-    with st.expander(tr("Recent product dataset preview")):
-        preview = snapshot_df.tail(10).rename(columns={column: tr(column) for column in snapshot_df.columns})
-        region_column = tr("region")
-        preview[region_column] = preview[region_column].map(region_label)
-        st.dataframe(preview, use_container_width=True)
+    if section == "dashboard":
+        render_kpis(snapshot_df, alert_df, anomalies_df, snapshot_date)
+        render_dashboard_charts(snapshot_df)
+    elif section == "price_prediction":
+        render_price_prediction(predictions, clean_df)
+    elif section == "stock_monitoring":
+        render_stock_monitoring(snapshot_df)
+    elif section == "shortage_detection":
+        render_shortage_detection(alert_df)
+    elif section == "anomaly_detection":
+        render_anomaly_detection(anomalies_df)
+    elif section == "regional_analysis":
+        render_regional_market(snapshot_df)
+    elif section == "what_if":
+        render_scenario_simulator(clean_df, predictions)
+    elif section == "smart_alerts":
+        render_smart_alerts(alert_df)
+    elif section == "reports":
+        render_reports(clean_df, alert_df)
+    elif section == "about":
+        render_about(clean_df)
+
+    if section == "dashboard":
+        with st.expander(tr("Recent product dataset preview")):
+            preview = snapshot_df.tail(10).rename(columns={column: tr(column) for column in snapshot_df.columns})
+            region_column = tr("region")
+            preview[region_column] = preview[region_column].map(region_label)
+            st.dataframe(preview, use_container_width=True)
 
 
 if __name__ == "__main__":
