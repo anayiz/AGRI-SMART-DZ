@@ -57,6 +57,67 @@ def tr(text, **values):
     return translate(st.session_state.get("language", "ar"), text, **values)
 
 
+def apply_visual_theme():
+    st.markdown(
+        """
+        <style>
+        :root { color-scheme: light; }
+        .stApp, [data-testid="stAppViewContainer"] {
+            background: #F5F7F5 !important;
+            color: #164B35 !important;
+        }
+        [data-testid="stHeader"] { background: #F5F7F5 !important; }
+        [data-testid="stSidebar"] { background: #DCEFE3 !important; }
+        [data-testid="stSidebar"] * { color: #164B35; }
+        h1, h2, h3 { color: #164B35; }
+        [data-testid="stMetric"] {
+            background: #FFFFFF;
+            border: 1px solid #DCEFE3;
+            border-radius: 12px;
+            padding: 14px;
+        }
+        [data-testid="stMetricLabel"], [data-testid="stMetricDelta"] {
+            color: #164B35 !important;
+            opacity: 1;
+        }
+        [data-testid="stMetricValue"] {
+            color: #164B35;
+            font-size: 1.35rem;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }
+        [data-baseweb="select"] > div, input, textarea {
+            background: #FFFFFF !important;
+            color: #164B35 !important;
+        }
+        input[type="radio"], input[type="checkbox"] { accent-color: #2E8B57; }
+        .stButton > button {
+            background: #2E8B57;
+            border: 1px solid #2E8B57;
+            border-radius: 8px;
+            color: #FFFFFF;
+        }
+        .stButton > button:hover { background: #164B35; border-color: #164B35; color: #FFFFFF; }
+        [data-testid="stAlert"] { border-radius: 10px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def style_chart(figure):
+    figure.update_layout(
+        template="plotly_white",
+        paper_bgcolor="#F5F7F5",
+        plot_bgcolor="#FFFFFF",
+        font={"color": "#164B35"},
+        colorway=["#164B35", "#2E8B57", "#78A98B", "#D49B26", "#9B5555"],
+    )
+    figure.update_xaxes(gridcolor="#E5EEE7", zerolinecolor="#DCEFE3")
+    figure.update_yaxes(gridcolor="#E5EEE7", zerolinecolor="#DCEFE3")
+    return figure
+
+
 def select_language():
     selection = st.sidebar.selectbox(
         translate("ar", "Language / Langue / اللغة"),
@@ -68,7 +129,8 @@ def select_language():
     if language == "ar":
         st.markdown(
             "<style>"
-            ".stApp, [data-testid='stSidebar'] {direction: rtl;}"
+            ".stApp {direction: ltr;}"
+            "[data-testid='stSidebar'], [data-testid='stMainBlockContainer'] {direction: rtl;}"
             ".stMarkdown, [data-testid='stMetric'], label {text-align: right;}"
             "</style>",
             unsafe_allow_html=True,
@@ -257,11 +319,15 @@ def render_kpis(clean_df, alert_df, anomalies_df, snapshot_date):
         else "GREEN"
     )
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric(tr("Highest regional price · {region}", region=region_label(latest["region"])), f"{current_price:.2f} DZD/kg")
-    col2.metric(tr("Estimated stock · all regions"), f"{stock_total:,.0f} tonnes")
-    col3.metric(tr("Highest regional risk"), alert_risk)
-    col4.metric(tr("Patterns to verify · last 90 days"), str(len(anomalies_df)))
+    price_stock_columns = st.columns(2)
+    risk_columns = st.columns(2)
+    price_stock_columns[0].metric(
+        tr("Highest regional price · {region}", region=region_label(latest["region"])),
+        f"{current_price:.2f} DZD/kg",
+    )
+    price_stock_columns[1].metric(tr("Estimated stock · all regions"), f"{stock_total:,.0f} tonnes")
+    risk_columns[0].metric(tr("Highest regional risk"), alert_risk)
+    risk_columns[1].metric(tr("Patterns to verify · last 90 days"), str(len(anomalies_df)))
     st.caption(tr("Regional metrics are the latest observations on or before {date}.", date=f"{snapshot_date:%d %b %Y}"))
 
 
@@ -281,6 +347,7 @@ def render_dashboard_charts(snapshot_df):
         template="plotly_white",
         labels={"region_display": tr("region"), "date": tr("date"), "price": tr("Price")},
     )
+    style_chart(fig_price)
     fig_stock = px.line(
         compare,
         x="date",
@@ -291,6 +358,7 @@ def render_dashboard_charts(snapshot_df):
         template="plotly_white",
         labels={"region_display": tr("region"), "date": tr("date"), "stock": tr("Stock")},
     )
+    style_chart(fig_stock)
     charts_left, charts_right = st.columns(2)
     charts_left.plotly_chart(fig_price, use_container_width=True)
     charts_right.plotly_chart(fig_stock, use_container_width=True)
@@ -308,6 +376,7 @@ def render_stock_monitoring(snapshot_df):
         template="plotly_white",
         labels={"region_label": tr("region"), "stock": tr("Stock")},
     )
+    style_chart(fig)
     st.plotly_chart(fig, use_container_width=True)
     st.dataframe(
         region_summary[["region_label", "date", "stock", "data_source"]].rename(
@@ -336,6 +405,7 @@ def render_regional_market(snapshot_df):
         template="plotly_white",
         labels={"region_label": tr("region"), "price": tr("Price")},
     )
+    style_chart(fig_region)
     st.plotly_chart(fig_region, use_container_width=True)
 
     map_data = region_summary.copy()
@@ -357,6 +427,7 @@ def render_regional_market(snapshot_df):
         title=tr("Regional market map · approximate city locations"),
         labels={"price": tr("Price"), "stock": tr("Stock")},
     )
+    style_chart(map_figure)
     map_figure.update_geos(
         lonaxis_range=[-9, 10],
         lataxis_range=[18, 38],
@@ -404,6 +475,7 @@ def render_price_prediction(predictions, latest_df):
         template="plotly_white",
         labels={forecast_date_label: forecast_date_label},
     )
+    style_chart(pred_fig)
     st.caption(tr("Forecast uses the latest available dataset date, independently of the selected historical snapshot."))
     st.plotly_chart(pred_fig, use_container_width=True)
 
@@ -558,6 +630,7 @@ def render_manual_inputs(clean_df):
 
 def main():
     select_language()
+    apply_visual_theme()
     section = select_section()
     ensure_demo_data()
     clean_df = load_dashboard_data()
