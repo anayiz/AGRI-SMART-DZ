@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -43,6 +45,8 @@ DB_PATH = str(Path(__file__).resolve().parents[1] / "agri_smart.db")
 QUALITY_LEVELS = ("OFFICIAL", "VERIFIED", "UNVERIFIED", "SYNTHETIC_DEMO")
 _engine: Engine | None = None
 _engine_key: str | None = None
+_initialized_key: str | None = None
+_init_lock = threading.RLock()
 _metadata = MetaData()
 
 categories = Table(
@@ -206,7 +210,7 @@ def _get_engine() -> Engine:
             def _enable_sqlite_constraints(dbapi_connection: Any, _connection_record: Any) -> None:
                 cursor = dbapi_connection.cursor()
                 cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.execute("PRAGMA busy_timeout=30000")
                 cursor.close()
         _engine_key = key
     return _engine
@@ -639,14 +643,74 @@ def seed_wilayas_from_geojson(path: str | None = None) -> int:
     return count
 
 
+@contextmanager
+def _database_initialization_lock() -> Iterator[None]:
+    """Serialize initialization across threads and separate Streamlit processes."""
+    with _init_lock:
+        url = _database_url()
+        if str(url).startswith(("postgres", "postgresql")):
+            yield
+            return
+
+        lock_path = Path(DB_PATH).with_name(Path(DB_PATH).name + ".init.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 30.0
+        descriptor: int | None = None
+
+        while descriptor is None:
+            try:
+                descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(descriptor, str(os.getpid()).encode("ascii"))
+            except FileExistsError:
+                try:
+                    stale_after = 120
+                    if time.time() - lock_path.stat().st_mtime > stale_after:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "Timed out waiting for AGRI-SMART DZ database initialization."
+                    )
+                time.sleep(0.1)
+
+        try:
+            yield
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def init_db() -> None:
+    global _initialized_key
     engine = _get_engine()
-    _metadata.create_all(engine)
-    with get_conn() as conn:
-        _ensure_legacy_schema(conn)
-        _seed_catalog(conn)
-        _migrate_legacy_observations(conn)
-    seed_wilayas_from_geojson()
+    key = str(_database_url())
+    if _initialized_key == key:
+        return
+
+    with _database_initialization_lock():
+        engine = _get_engine()
+        key = str(_database_url())
+        if _initialized_key == key:
+            return
+
+        if engine.dialect.name == "sqlite":
+            with engine.connect() as conn:
+                conn.execute(text("PRAGMA busy_timeout=30000"))
+                conn.execute(text("PRAGMA journal_mode=WAL"))
+
+        _metadata.create_all(engine)
+        with get_conn() as conn:
+            _ensure_legacy_schema(conn)
+            _seed_catalog(conn)
+            _migrate_legacy_observations(conn)
+        seed_wilayas_from_geojson()
+        _initialized_key = key
 
 
 def list_products(active_only: bool = True) -> pd.DataFrame:

@@ -166,8 +166,6 @@ def ensure_demo_data():
 
 @st.cache_data
 def load_dashboard_data():
-    ensure_demo_data()
-    db.init_db()
     clean = dp.load_clean("Potato")
     clean["date"] = pd.to_datetime(clean["date"])
     return clean.sort_values(["region", "date"]).reset_index(drop=True)
@@ -644,7 +642,6 @@ NEW_NAVIGATION = (
 
 @st.cache_data(ttl=60)
 def load_market_observations():
-    db.init_db()
     return db.get_market_observations()
 
 

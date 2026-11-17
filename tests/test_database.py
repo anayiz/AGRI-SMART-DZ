@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from src import database as db
@@ -55,6 +56,27 @@ class DatabaseImportTests(unittest.TestCase):
             db.add_manual_observation("Potato", "Alger", "2026-07-24", 70, -1)
         self.assertTrue(db.get_prices().empty)
         self.assertTrue(db.get_stock().empty)
+
+    def test_concurrent_initialization_preserves_catalog_and_is_idempotent(self):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(db.init_db) for _ in range(8)]
+            for future in futures:
+                future.result(timeout=45)
+
+        db.init_db()
+        products = db.list_products()
+        self.assertEqual(len(products), 15)
+        self.assertIn("Potato", set(products["product_name"]))
+
+        with db.get_conn() as conn:
+            journal_mode = conn.execute(
+                db.text("PRAGMA journal_mode")
+            ).scalar_one()
+            busy_timeout = conn.execute(
+                db.text("PRAGMA busy_timeout")
+            ).scalar_one()
+        self.assertEqual(journal_mode.lower(), "wal")
+        self.assertGreaterEqual(busy_timeout, 30000)
 
 
 if __name__ == "__main__":
