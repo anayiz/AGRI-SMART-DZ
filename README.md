@@ -1,38 +1,28 @@
 # AGRI-SMART DZ
 
-**AI-Powered Agricultural Market Intelligence and Early Warning Platform for Food Security in Algeria.**
+AGRI-SMART DZ is a Streamlit agricultural market-intelligence prototype for Algeria. It combines a multi-product catalog, sourced market observations, price-history analysis, experimental forecasts, explainable early-warning signals, regional visualization, hypothetical scenarios, and downloadable reports. The original potato demonstration remains available as a separate classic view.
 
-AGRI-SMART DZ is a Streamlit prototype for exploring agricultural market signals. The current MVP focuses on potato prices and estimated stock across eight demo regions. It combines price forecasts, stock monitoring, rule-based shortage alerts, anomaly review, regional comparisons, and illustrative supply scenarios.
+> **Data integrity:** Bundled and generated sample observations are synthetic demonstrations, not verified market data. The application does not currently connect to Algerian ministry feeds, official statistics APIs, or live wholesale/retail markets. Manual or imported observations retain their source and quality status; users must verify their provenance.
 
-> **Data and model limitation:** The included market observations and trained model artifacts are synthetic demonstration data, not verified Algerian market data. The application does not provide real-time market access or legal findings. Alerts and anomalies are signals for verification only.
-
-## Application screenshots
-
-Screenshots are not included yet. Add reviewed Arabic and French desktop/mobile captures here after they have been produced and approved.
+> **Operational limitation:** Forecasts and risk alerts are analytical signals, not guarantees, official shortage declarations, or substitutes for field verification. The included wilaya GeoJSON has no documented provenance or license in this repository; validate its boundaries and usage rights before operational use.
 
 ## Features
 
-- Arabic and French interface, with RTL layout for Arabic.
-- Potato price forecasts for 7- and 30-day horizons.
-- Regional price and stock comparisons, plus an approximate city-level map.
-- GREEN / YELLOW / RED shortage-risk indicators and rule-based alerts.
-- Isolation Forest anomaly signals labeled as requiring verification.
-- What-if supply adjustments, presented as illustrative model sensitivity rather than causal estimates.
-- Manual price and stock entry, and CSV report exports.
-- Synthetic data labeling throughout the demo workflow.
+- **Multi-product monitoring:** Initial configurable catalog across vegetables, oils, fruits, cereals, and essential foods, including potato, tomato, onion, garlic, cooking oil, milk, sugar, rice, wheat, flour, and semolina. Additional products and units can be added in the data-management page.
+- **Observation management:** Manual entry and CSV/Excel import for date, product, wilaya/region, market, price, quantity, incoming supply, unit, source, collection method, quality, and notes. Import validation reports invalid records and duplicate rows before saving.
+- **Source and quality labels:** `OFFICIAL`, `VERIFIED`, `UNVERIFIED`, and `SYNTHETIC_DEMO` are stored with observations. These labels record supplied metadata; the app does not independently verify sources.
+- **Market dashboard:** Filterable product/category/region/date/quality views, historical trends, latest regional price comparisons, stock indicators, and recent explainable risk alerts. Averages across distinct products or units are intentionally not combined.
+- **Algeria map:** Plotly renders the bundled 58-feature GeoJSON, colors matching observed wilayas by the app's rule-based risk level, and leaves unmatched areas as no data. Selecting a wilaya shows available latest observations and history. Boundary provenance and licensing are not documented.
+- **Forecast experiments:** Separate 7- and 30-day forecasts by product, unit, and region. Linear Regression, Random Forest, and Gradient Boosting are evaluated against a persistence baseline on a chronological holdout. The page reports MAE, RMSE, and R² and distinguishes observed holdout values from forecasts. Empirical holdout residual ranges are indicative, not guaranteed calibrated confidence intervals.
+- **Early warnings:** Rule-based price-change and reported-stock comparisons produce explainable anomaly/watch signals and suggested verification actions. A price anomaly alone is not labeled a confirmed shortage; the system does not autonomously confirm shortages.
+- **Hypothetical scenarios:** Production, demand, distribution delay, stock, and transport-cost adjustments are used in a transparent sensitivity calculation. Results are hypothetical, not causal estimates or market predictions.
+- **Reports:** Filtered market observations and alerts can be downloaded as CSV, Excel, and PDF. Observation dates, sources, quality, units, and alert indicators are included where available.
+- **Languages and visual design:** Arabic (RTL), French, and English with the green AGRI-SMART DZ palette.
+- **Classic potato experience:** The pre-existing potato demo views remain accessible from navigation.
 
-## Technology
+## Requirements and local setup
 
-| Area | Technology |
-| --- | --- |
-| Application | Python 3.12, Streamlit |
-| Data and charts | pandas, NumPy, Plotly |
-| Machine learning | scikit-learn (Random Forest, Linear Regression, Isolation Forest) |
-| Local storage | SQLite |
-| Model serialization | joblib |
-| Demo inputs | CSV files in `data/` |
-
-## Quick start
+Python 3.10+ is recommended. Runtime dependencies are pinned in `requirements.txt`.
 
 ### Windows PowerShell
 
@@ -45,55 +35,61 @@ py -3.12 -m venv .venv
 ### Linux or macOS
 
 ```bash
-python3.12 -m venv .venv
+python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m streamlit run app.py
 ```
 
-The app initializes a local SQLite database and imports the included synthetic CSV data when the database has no potato market observations. The database is local and is intentionally excluded from Git. If model files are missing or incompatible, the prediction workflow trains replacement models from the included demo data; the first forecast request may therefore take longer.
+The app initializes a local SQLite database (`agri_smart.db`) and seeds synthetic demonstration observations when needed. The classic potato module also retains its original demo data flow. Do not treat either dataset as observed market data.
 
-To run the focused tests:
+Run the automated tests from the project root:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-## Project layout
+## Persistence and deployment
+
+SQLite is the zero-configuration local/demo backend. Streamlit Community Cloud does not guarantee persistence of files written to the application container, so SQLite there is not suitable for durable production records.
+
+The SQLAlchemy persistence layer supports PostgreSQL through `DATABASE_URL`. Set it in the deployment platform's secret/environment-variable manager (never commit credentials), for example:
 
 ```text
-app.py                  Streamlit entry point
-requirements.txt        Runtime dependencies
-.streamlit/config.toml  Public UI theme settings
-data/                   Synthetic demonstration CSV datasets
-models/                 Locally trained model artifacts (Git-ignored)
-src/database.py         SQLite schema and data access
-src/data_processing.py  Feature engineering and chronological splitting
-src/price_prediction.py Model training, evaluation, and forecasts
-src/generate_data.py    Synthetic demo-data generator
-src/translations.py     Arabic and French interface strings
-tests/                  Focused unit tests
-tools/                  Optional GEW 2026 dossier generator
+postgresql://<user>:<password>@<host>:5432/<database>
 ```
 
-## Dependencies
+The app initializes its schema on startup. Configure a managed PostgreSQL service, access controls, backups, and a secure connection string before relying on hosted records. This repository does not provision that database or provide real-data integrations.
 
-The application runtime dependencies and tested versions are listed in [`requirements.txt`](requirements.txt). The separate `tools/requirements-gew2026.txt` file is only needed to generate the optional competition dossier.
+## Repository structure
 
-## Deploy on Streamlit Community Cloud
+```text
+app.py                         Streamlit UI and feature integration
+src/database.py                SQLAlchemy schema, SQLite/PostgreSQL persistence
+src/data_import.py             CSV/Excel parsing, validation, duplicate handling
+src/market_intelligence.py     Forecasting, risk signals, scenario sensitivity
+src/reporting.py               CSV, Excel, and PDF report generation
+src/data_processing.py         Existing data cleanup and feature preparation
+src/price_prediction.py        Existing classic potato model workflow
+src/generate_data.py           Synthetic demonstration data generation
+src/translations.py            Arabic/French translations with English fallback
+data/                           Demo data and wilaya GeoJSON
+tests/                          Unit tests for import, intelligence, and reports
+```
 
-1. Push this repository to GitHub after reviewing the files and confirming the push.
-2. In Streamlit Community Cloud, create an app from the repository's `main` branch.
-3. Set the main file path to `app.py` and select Python 3.12.
-4. Deploy; Community Cloud installs dependencies from `requirements.txt`.
+## Known limitations
 
-### Cloud storage limitation
+- No live or authorized official Algerian market/statistics data source is connected.
+- Quality values such as `OFFICIAL` and `VERIFIED` are user-supplied labels, not proof of verification.
+- The GeoJSON's source, boundary accuracy, and license are undocumented; do not make operational coverage claims until these are verified.
+- Forecast suitability depends on sufficient clean historical observations. Metrics are computed from the available chronological holdout and should not be generalized beyond it.
+- Shortage alerts are threshold-based indicators using reported price and stock, not confirmed shortages; supply, production, demand, and seasonality coverage is currently limited by available observations.
+- Scenario outputs are simple sensitivity calculations and do not estimate causal market effects.
+- Hosted durable storage requires an externally provisioned PostgreSQL database and correctly configured secrets.
 
-The application currently stores manual entries in a local SQLite file. Streamlit Community Cloud does not guarantee persistence of files written to the app container across restarts or redeployments. Demo CSVs are part of the repository and can be re-imported, but manual updates should be treated as temporary. Persistent multi-user storage requires implementing and configuring an external database (for example, PostgreSQL); this project does not currently include that integration.
+## Optional competition dossier
 
-## Competition dossier
-
-The optional dossier generator is in `tools/generate_gew2026_dossier.py`. Its document-generation dependencies are listed separately in `tools/requirements-gew2026.txt`. PDF conversion requires LibreOffice (`soffice`) on `PATH`; see the generator's help for available options.
+The dossier generator is in `tools/generate_gew2026_dossier.py`; its optional dependencies are listed in `tools/requirements-gew2026.txt`. PDF conversion requires LibreOffice (`soffice`) on `PATH`.
 
 ## License
 
-No license has been selected for this repository. Until a license is added, public visibility does not grant permission to reuse or redistribute the code.
+No license has been selected for this repository. Public visibility alone does not grant permission to reuse or redistribute the code.

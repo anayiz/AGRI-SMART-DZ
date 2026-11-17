@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -7,6 +8,7 @@ from sklearn.ensemble import IsolationForest
 
 from src import data_processing as dp
 from src import database as db
+from src import data_import, market_intelligence, reporting
 from src.price_prediction import model_is_current, predict_latest, train_and_evaluate
 from src.translations import translate, translate_region
 
@@ -121,10 +123,10 @@ def style_chart(figure):
 def select_language():
     selection = st.sidebar.selectbox(
         translate("ar", "Language / Langue / اللغة"),
-        ["العربية", "Français"],
+        ["العربية", "Français", "English"],
         index=0,
     )
-    language = "ar" if selection == "العربية" else "fr"
+    language = {"العربية": "ar", "Français": "fr", "English": "en"}[selection]
     st.session_state["language"] = language
     if language == "ar":
         st.markdown(
@@ -533,14 +535,14 @@ def render_reports(clean_df, alert_df):
     st.warning(tr("Exported values retain their dataset source labels; synthetic data is not verified market data."))
     st.download_button(
         tr("Download market dataset (CSV)"),
-        data=clean_df.to_csv(index=False).encode("utf-8-sig"),
+        data=reporting.to_csv_bytes(clean_df),
         file_name="agri_smart_market_data.csv",
         mime="text/csv",
     )
     if not alert_df.empty:
         st.download_button(
             tr("Download current alerts (CSV)"),
-            data=alert_df.to_csv(index=False).encode("utf-8-sig"),
+            data=reporting.to_csv_bytes(alert_df),
             file_name="agri_smart_alerts.csv",
             mime="text/csv",
         )
@@ -628,77 +630,707 @@ def render_manual_inputs(clean_df):
             st.rerun()
 
 
+NEW_NAVIGATION = (
+    ("market_dashboard", "Dashboard"),
+    ("algeria_map", "Regional map"),
+    ("multi_forecast", "Price forecast"),
+    ("early_warnings", "Early warnings"),
+    ("data_management", "Market data management"),
+    ("scenario_simulation", "Hypothetical scenario simulator"),
+    ("market_reports", "Report and export"),
+    ("potato_classic", "Potato demo (classic)"),
+)
+
+
+@st.cache_data(ttl=60)
+def load_market_observations():
+    db.init_db()
+    return db.get_market_observations()
+
+
+def _localized_region_name(row, language):
+    column = {"ar": "name_ar", "en": "name_en", "fr": "name_fr"}.get(language, "name_fr")
+    return row.get(column) or row.get("name_fr") or row.get("wilaya_code")
+
+
+def _region_options(observations, wilayas, language):
+    names = {str(value).strip() for value in observations.get("region", pd.Series(dtype=str)).dropna()}
+    if "region" in observations:
+        names.update(observations["region"].dropna().astype(str).str.strip())
+    return sorted(names | {"All regions"})
+
+
+def _normalize_wilaya_code(value):
+    try:
+        return str(int(str(value).strip())).zfill(2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _map_wilaya_codes(observations, wilayas):
+    if observations.empty:
+        return observations.assign(map_code=pd.Series(dtype=str))
+    name_to_code = {}
+    for row in wilayas.to_dict(orient="records"):
+        for field in ("name_fr", "name_ar", "name_en"):
+            name = row.get(field)
+            if name:
+                name_to_code[str(name).strip().casefold()] = str(row["wilaya_code"]).zfill(2)
+    frame = observations.copy()
+    frame["map_code"] = frame.apply(
+        lambda row: _normalize_wilaya_code(row.get("wilaya_code"))
+        or name_to_code.get(str(row.get("region", "")).strip().casefold()),
+        axis=1,
+    )
+    return frame
+
+
+def _latest_by_region(data):
+    if data.empty:
+        return data.copy()
+    frame = data.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame.dropna(subset=["date"]).sort_values("date")
+    return frame.groupby("region", as_index=False, sort=False).tail(1).reset_index(drop=True)
+
+
+def _optional_nonnegative_measure(value, label):
+    value = str(value).strip()
+    if not value:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a non-negative number.") from error
+    if pd.isna(number) or abs(number) == float("inf") or number < 0:
+        raise ValueError(f"{label} must be a finite, non-negative number.")
+    return number
+
+
+def _risk_for_map(risks, region):
+    matching = risks[risks["region"].astype(str) == str(region)] if not risks.empty else risks
+    if matching.empty:
+        return "Normal availability"
+    level = str(matching.iloc[0]["risk_level"]).upper()
+    return {
+        "YELLOW": "Under observation",
+        "ORANGE": "High risk",
+        "RED": "Critical risk",
+    }.get(level, "Under observation")
+
+
+def _selected_observations(all_data, product, category, region, date_range, quality):
+    frame = all_data.copy()
+    if product != "All":
+        frame = frame[frame["product"] == product]
+    if category != "All":
+        frame = frame[frame["category"] == category]
+    if region != "All regions":
+        frame = frame[frame["region"].astype(str) == region]
+    if quality != "All":
+        frame = frame[frame["data_quality"] == quality]
+    if date_range and len(date_range) == 2:
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame[dates.dt.date.between(date_range[0], date_range[1])]
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    return frame.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+
+def _render_dashboard(data):
+    st.subheader(tr("Market Intelligence"))
+    if data.empty:
+        st.info(tr("No observations match the selected filters."))
+        return
+    latest = _latest_by_region(data)
+    latest_prices = latest["price"].dropna() if "price" in latest else pd.Series(dtype=float)
+    risks = market_intelligence.detect_shortage_risks(data)
+    products_count = data["product"].nunique()
+    wilayas_count = data.loc[data["wilaya_code"].notna(), "wilaya_code"].nunique()
+    metrics = st.columns(4)
+    metrics[0].metric(tr("Products with observations"), products_count)
+    metrics[1].metric(tr("Wilayas with observations"), wilayas_count)
+    metrics[2].metric(
+        tr("Latest average price"),
+        (
+            f"{latest_prices.mean():,.2f} DZD/{latest['unit'].dropna().iloc[0]}"
+            if "unit" in latest and latest["unit"].nunique(dropna=True) == 1
+            else f"{latest_prices.mean():,.2f} DZD"
+        )
+        if not latest_prices.empty and products_count == 1 and ("unit" not in latest or latest["unit"].nunique(dropna=True) <= 1)
+        else "—",
+    )
+    metrics[3].metric(tr("Products with alerts"), risks["product"].nunique() if not risks.empty else 0)
+    if products_count > 1:
+        st.caption(tr("Select one product to see an average price; averages across different products are not meaningful."))
+
+    chart_data = data[data["price"].notna()]
+    if not chart_data.empty:
+        left, right = st.columns(2)
+        with left:
+            st.markdown(f"#### {tr('Price trend')}")
+            trend = chart_data.groupby(["date", "product", "unit"], as_index=False, dropna=False)["price"].median()
+            trend["series"] = trend["product"].astype(str) + " (" + trend["unit"].fillna(tr("Unit")).astype(str) + ")"
+            trend_figure = px.line(
+                trend,
+                x="date",
+                y="price",
+                color="series",
+                facet_col="series" if trend["series"].nunique() > 1 else None,
+                facet_col_wrap=2 if trend["series"].nunique() > 1 else None,
+                labels={"date": tr("Date"), "price": tr("Price per unit"), "series": tr("Product") + " · " + tr("Unit")},
+            )
+            if trend["series"].nunique() > 1:
+                trend_figure.update_yaxes(matches=None)
+            st.plotly_chart(
+                style_chart(trend_figure),
+                use_container_width=True,
+            )
+        with right:
+            st.markdown(f"#### {tr('Regional latest prices')}")
+            regional_products = sorted(chart_data["product"].dropna().astype(str).unique())
+            if regional_products:
+                regional_product = st.selectbox(
+                    tr("Product"),
+                    regional_products,
+                    key="dashboard_regional_product",
+                )
+                regional_data = chart_data[chart_data["product"] == regional_product]
+                regional_units = sorted(regional_data["unit"].dropna().astype(str).unique())
+                if len(regional_units) > 1:
+                    regional_unit = st.selectbox(tr("Unit"), regional_units, key="dashboard_regional_unit")
+                    regional_data = regional_data[regional_data["unit"] == regional_unit]
+                regional = _latest_by_region(regional_data).dropna(subset=["price"])
+                if not regional.empty:
+                    regional_figure = px.bar(
+                        regional.sort_values("price"),
+                        x="price",
+                        y="region",
+                        orientation="h",
+                        color="price",
+                        labels={"price": tr("Price per unit"), "region": tr("Region")},
+                    )
+                    st.plotly_chart(style_chart(regional_figure), use_container_width=True)
+                else:
+                    st.info(tr("No price data available."))
+    left, right = st.columns(2)
+    with left:
+        st.markdown(f"#### {tr('Products with the highest price increases')}")
+        increase_rows = []
+        for (product, region, unit), group in data.dropna(subset=["price"]).groupby(
+            ["product", "region", "unit"], dropna=False
+        ):
+            group = group.sort_values("date")
+            latest_row = group.iloc[-1]
+            baseline = group.loc[group["date"] < latest_row["date"], "price"].tail(30)
+            if not baseline.empty and baseline.median() > 0:
+                increase_rows.append({
+                    "product": product,
+                    "region": region,
+                    "unit": unit,
+                    "price_change_pct": round((latest_row["price"] / baseline.median() - 1) * 100, 1),
+                    "date": latest_row["date"].date(),
+                })
+        if increase_rows:
+            increases = pd.DataFrame(increase_rows).nlargest(5, "price_change_pct")
+            st.dataframe(increases.rename(columns={"product": tr("Product"), "region": tr("Region"), "unit": tr("Unit"), "price_change_pct": tr("Price change (%)"), "date": tr("Date")}), hide_index=True, use_container_width=True)
+        else:
+            st.info(tr("No price data available."))
+    with right:
+        st.markdown(f"#### {tr('Latest alerts')}")
+        if risks.empty:
+            st.success(tr("Normal availability"))
+        else:
+            st.dataframe(
+                risks[["product", "region", "unit", "date", "risk_level", "status", "reason"]]
+                .rename(columns={"product": tr("Product"), "region": tr("Region"), "unit": tr("Unit"), "date": tr("Date"), "risk_level": tr("Risk level"), "status": tr("Status"), "reason": tr("Detection explanation")}),
+                hide_index=True,
+                use_container_width=True,
+            )
+    if "quantity" in data and data["quantity"].notna().any():
+        stock = _latest_by_region(data[data["quantity"].notna()])
+        st.markdown(f"#### {tr('Latest stock availability')}")
+        st.dataframe(stock[["product", "region", "quantity", "incoming_supply", "date", "data_quality"]].rename(columns={"product": tr("Product"), "region": tr("Region"), "quantity": tr("Available stock (optional)"), "incoming_supply": tr("Incoming supply (optional)"), "date": tr("Date"), "data_quality": tr("Data quality")}), hide_index=True, use_container_width=True)
+
+
+def _render_algeria_map(data, all_data, wilayas):
+    st.subheader(tr("Wilaya boundaries (GeoJSON)"))
+    st.warning(tr("Boundary-source and license metadata are not documented in this repository; verify before operational use."))
+    st.caption(tr("The map only colors wilayas with matching observed records. Missing areas remain explicitly marked as no data."))
+    products = sorted(all_data["product"].dropna().unique()) if not all_data.empty else []
+    if not products:
+        st.info(tr("No observations match the selected filters."))
+        return
+    current_product = st.selectbox(tr("Product"), products, key="map_product")
+    product_data = data[data["product"] == current_product]
+    if product_data.empty:
+        st.info(tr("No observations match the selected filters."))
+        return
+    map_units = sorted(product_data["unit"].dropna().astype(str).unique())
+    if len(map_units) > 1:
+        selected_unit = st.selectbox(tr("Unit"), map_units, key="map_unit")
+        product_data = product_data[product_data["unit"] == selected_unit]
+    risks = market_intelligence.detect_shortage_risks(product_data)
+    latest = _map_wilaya_codes(_latest_by_region(product_data), wilayas)
+    latest = latest.dropna(subset=["map_code"])
+    if latest.empty:
+        st.warning(tr("No wilaya codes could be matched to the observed region names; map locations are not inferred."))
+        return
+
+    geo_path = ROOT / "data" / "algeria_wilayas_58.geojson"
+    with geo_path.open(encoding="utf-8") as geo_file:
+        geojson = json.load(geo_file)
+    records = latest.to_dict(orient="records")
+    by_code = {row["map_code"]: row for row in records}
+    map_rows = []
+    for feature in geojson.get("features", []):
+        properties = feature.get("properties", {})
+        code = str(properties.get("CdWilaya_2019", "")).zfill(2)
+        row = by_code.get(code)
+        risk = _risk_for_map(risks, row.get("region")) if row else "No data"
+        map_rows.append({
+            "map_code": code,
+            "wilaya": properties.get("LbWilaya_2019", code),
+            "region": row.get("region") if row else None,
+            "price": row.get("price") if row else None,
+            "unit": row.get("unit") if row else None,
+            "quantity": row.get("quantity") if row else None,
+            "incoming_supply": row.get("incoming_supply") if row else None,
+            "date": row.get("date") if row else None,
+            "source_name": row.get("source_name") if row else None,
+            "data_quality": row.get("data_quality") if row else None,
+            "risk": risk,
+        })
+    map_frame = pd.DataFrame(map_rows)
+    colors = {
+        "No data": "#B9C2BC",
+        "Normal availability": "#2E8B57",
+        "Under observation": "#E8C547",
+        "High risk": "#E58A32",
+        "Critical risk": "#B83333",
+    }
+    figure = px.choropleth(
+        map_frame,
+        geojson=geojson,
+        locations="map_code",
+        featureidkey="properties.CdWilaya_2019",
+        color="risk",
+        color_discrete_map=colors,
+        category_orders={"risk": list(colors)},
+        hover_name="wilaya",
+        hover_data={"map_code": False, "risk": True, "region": True, "price": ":.2f", "quantity": ":.2f", "incoming_supply": ":.2f", "date": True, "source_name": True, "data_quality": True},
+        labels={"risk": tr("Risk level"), "region": tr("Region"), "price": tr("Price per unit"), "quantity": tr("Available stock (optional)"), "incoming_supply": tr("Incoming supply (optional)"), "date": tr("Latest observation"), "source_name": tr("Source name"), "data_quality": tr("Data quality")},
+    )
+    figure.update_geos(fitbounds="locations", visible=False, bgcolor="#F5F7F5")
+    figure.update_layout(clickmode="event+select", paper_bgcolor="#F5F7F5", margin={"l": 0, "r": 0, "t": 0, "b": 0}, legend_title_text=tr("Risk level"))
+    selection = st.plotly_chart(figure, use_container_width=True, on_select="rerun", selection_mode="points", key="wilaya_choropleth")
+    selected_code = None
+    try:
+        selected_points = selection.selection.points
+        if selected_points:
+            selected_code = str(selected_points[0].get("location", "")).zfill(2)
+    except (AttributeError, KeyError, TypeError):
+        selected_code = None
+    names = {
+        str(row["wilaya_code"]).zfill(2): _localized_region_name(row, st.session_state.get("language", "ar"))
+        for row in wilayas.to_dict(orient="records")
+    }
+    codes = [str(row["wilaya_code"]).zfill(2) for row in wilayas.to_dict(orient="records")]
+    if selected_code not in codes:
+        selected_code = codes[0] if codes else None
+    if not selected_code:
+        return
+    selected_wilaya = st.selectbox(tr("Map selection"), codes, index=codes.index(selected_code), format_func=lambda code: f"{code} — {names.get(code, code)}", key="wilaya_details")
+    detail = map_frame[map_frame["map_code"] == selected_wilaya]
+    if detail.empty or detail.iloc[0]["risk"] == "No data":
+        st.info(tr("No observations match the selected filters."))
+        return
+    record = detail.iloc[0]
+    st.markdown(f"### {names.get(selected_wilaya, record['wilaya'])}")
+    columns = st.columns(4)
+    unit = str(record.get("unit") or "")
+    price_value = f"{record['price']:,.2f} DZD/{unit}" if pd.notna(record["price"]) and unit else f"{record['price']:,.2f} DZD" if pd.notna(record["price"]) else "—"
+    columns[0].metric(tr("Latest average price"), price_value)
+    columns[1].metric(tr("Available stock (optional)"), f"{record['quantity']:,.2f}" if pd.notna(record["quantity"]) else "—")
+    columns[2].metric(tr("Risk level"), tr(record["risk"]))
+    columns[3].metric(tr("Latest observation"), str(record["date"].date()) if pd.notna(record["date"]) else "—")
+    st.caption(f"{tr('Source and quality')}: {record['source_name']} · {record['data_quality']}")
+    history = product_data[product_data["region"].astype(str) == str(record["region"])].dropna(subset=["price"])
+    if not history.empty:
+        st.plotly_chart(style_chart(px.line(history, x="date", y="price", labels={"date": tr("Date"), "price": tr("Price per unit")})), use_container_width=True)
+
+
+def _render_forecast(data, product):
+    st.subheader(tr("Price forecast"))
+    eligible = sorted(data["product"].dropna().unique()) if not data.empty else []
+    if product == "All":
+        product = st.selectbox(tr("Product"), eligible or ["Potato"], key="forecast_product")
+    product_data = data[data["product"] == product] if not data.empty else pd.DataFrame()
+    forecast_unit = ""
+    if "unit" in product_data and product_data["unit"].dropna().nunique() > 1:
+        units = sorted(product_data["unit"].dropna().astype(str).unique())
+        selected_unit = st.selectbox(tr("Unit"), units, key="forecast_unit")
+        product_data = product_data[product_data["unit"] == selected_unit]
+        forecast_unit = selected_unit
+    elif "unit" in product_data and product_data["unit"].notna().any():
+        forecast_unit = str(product_data["unit"].dropna().iloc[0])
+    horizon = st.radio(tr("Forecast horizon"), [7, 30], horizontal=True, format_func=lambda days: f"{days} days")
+    if product_data.empty:
+        st.info(tr("No observations match the selected filters."))
+        return
+    result = market_intelligence.forecast_product(product_data, int(horizon))
+    if result["status"] != "ok":
+        st.warning(f"{tr('Insufficient data')}: {result['reason']}")
+        st.caption(tr("No validated forecast is available for this product and horizon."))
+        return
+    st.caption(f"{tr('Predicted')} · {product} · {horizon} days · {tr('Validation metrics (chronological holdout)')}")
+    st.caption(tr("Forecasts are estimates; observed market prices and test-set results are shown separately."))
+    metrics = result["metrics"]
+    st.dataframe(pd.DataFrame([{"model": name, **values} for name, values in metrics.items()]).rename(columns={"model": tr("Model"), "MAE": "MAE", "RMSE": "RMSE", "R2": "R²"}), hide_index=True, use_container_width=True)
+    predictions = result["predictions"].melt(id_vars=["target_date", "region"], value_vars=["actual_price", "predicted_price"], var_name="series", value_name="price")
+    predictions["series"] = predictions["series"].map({"actual_price": tr("Observed"), "predicted_price": tr("Predicted")})
+    st.plotly_chart(style_chart(px.line(predictions, x="target_date", y="price", color="series", line_dash="region", labels={"target_date": tr("Date"), "price": tr("Price per unit"), "series": tr("Series"), "region": tr("Region")})), use_container_width=True)
+    forecasts = result["forecast"]
+    if "unit" not in forecasts:
+        forecasts["unit"] = forecast_unit
+    st.caption(f"{tr('Uncertainty interval')}: {result['uncertainty']}")
+    st.dataframe(forecasts.rename(columns={"region": tr("Region"), "date": tr("Latest observation"), "price": tr("Observed"), "predicted_price": tr("Predicted"), "lower_90": tr("Lower 90% interval"), "upper_90": tr("Upper 90% interval"), "target_date": tr("Forecast date"), "model": tr("Model")}), hide_index=True, use_container_width=True)
+    db.save_prediction_records(product, forecasts, metrics, int(horizon))
+
+
+def _render_early_warnings(data):
+    st.subheader(tr("Early warnings"))
+    if data.empty:
+        st.info(tr("No observations match the selected filters."))
+        return
+    risks = market_intelligence.detect_shortage_risks(data)
+    st.caption(tr("No automated confirmed-shortage determination is made."))
+    if risks.empty:
+        st.success(tr("Normal availability"))
+        return
+    db.save_risk_alerts(risks)
+    for record in risks.to_dict(orient="records"):
+        heading = f"{record['product']} · {record['region']} · {tr(record['risk_level'].title())} · {record['date']}"
+        with st.expander(heading):
+            st.write(f"**{tr('Status')}:** {tr(record['status'].replace('_', ' ').title())}")
+            st.write(f"**{tr('Detection explanation')}:** {record['reason']}")
+            indicators = []
+            if pd.notna(record["price_change_pct"]):
+                indicators.append(f"{tr('Price change (%)')}: {record['price_change_pct']:.1f}%")
+            if pd.notna(record["stock_ratio"]):
+                indicators.append(f"{tr('Stock ratio')}: {record['stock_ratio']:.2f}×")
+            st.write(" · ".join(indicators) or tr("No stock/supply observations are available."))
+            st.write(f"**{tr('Recommended action')}:** {record['recommended_action']}")
+            st.caption(f"{tr('Data quality')}: {record['data_quality']}")
+    st.dataframe(risks.rename(columns={"product": tr("Product"), "region": tr("Region"), "unit": tr("Unit"), "date": tr("Date"), "risk_level": tr("Risk level"), "status": tr("Status"), "reason": tr("Detection explanation"), "recommended_action": tr("Recommended action"), "data_quality": tr("Data quality")}), hide_index=True, use_container_width=True)
+
+
+def _render_data_management(products, wilayas):
+    st.subheader(tr("Market data management"))
+    if db.get_database_backend() == "sqlite":
+        st.warning(tr("SQLite is suitable for local demonstration, but a local file may not persist on hosted Streamlit. Configure DATABASE_URL with PostgreSQL for durable hosted storage."))
+    if not wilayas.empty:
+        st.caption(f"{tr('Wilayas with observations')}: {len(wilayas)}")
+    with st.expander(tr("Add product")):
+        with st.form("add_product_form"):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input(tr("Product name"), max_chars=120)
+            categories = sorted(set(products["category_name"].dropna().astype(str)) | {"Other"}) if not products.empty else ["Other"]
+            category = c2.selectbox(tr("Product category"), categories)
+            unit = c3.text_input(tr("Unit"), value="kg", max_chars=40)
+            add_product = st.form_submit_button(tr("Add product"))
+        if add_product:
+            try:
+                if not name.strip():
+                    raise ValueError("Product name is required.")
+                db.add_product(name, category, unit)
+                load_market_observations.clear()
+                st.success(tr("Product added."))
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+    with st.form("manual_observation_form"):
+        st.markdown(f"#### {tr('Add observation')}")
+        c1, c2 = st.columns(2)
+        product_names = sorted(products["product_name"].dropna().astype(str).unique()) if not products.empty else ["Potato"]
+        product = c1.selectbox(tr("Product"), product_names)
+        region_rows = wilayas.to_dict(orient="records")
+        language = st.session_state.get("language", "ar")
+        code_to_name = {str(row["wilaya_code"]).zfill(2): _localized_region_name(row, language) for row in region_rows}
+        codes = sorted(code_to_name)
+        if codes:
+            code = c2.selectbox(tr("Region"), codes, format_func=lambda value: f"{value} — {code_to_name[value]}")
+            region = code_to_name[code]
+        else:
+            code, region = None, c2.text_input(tr("Region"))
+        c3, c4 = st.columns(2)
+        observation_date = c3.date_input(tr("Observation date"))
+        market = c4.text_input(tr("Market name (optional)"))
+        c5, c6, c7 = st.columns(3)
+        price = c5.text_input(tr("Price (DZD per unit)"), value="")
+        quantity = c6.text_input(tr("Available stock (optional)"), value="")
+        incoming = c7.text_input(tr("Incoming supply (optional)"), value="")
+        c8, c9 = st.columns(2)
+        source = c8.text_input(tr("Source name"), value="Manual entry — unverified")
+        quality = c9.selectbox(tr("Data quality"), ["UNVERIFIED", "VERIFIED"])
+        submitted = st.form_submit_button(tr("Save observation"))
+    if submitted:
+        try:
+            if not region:
+                raise ValueError("Enter a region.")
+            price_value = _optional_nonnegative_measure(price, "Price")
+            quantity_value = _optional_nonnegative_measure(quantity, "Available stock")
+            incoming_value = _optional_nonnegative_measure(incoming, "Incoming supply")
+            if all(value is None for value in (price_value, quantity_value, incoming_value)):
+                raise ValueError("Enter at least one measurement.")
+            db.add_manual_observation(
+                product, region, observation_date,
+                price=price_value,
+                quantity=quantity_value,
+                incoming_supply=incoming_value,
+                market=market, source_name=source.strip() or "Manual entry",
+                data_quality=quality, wilaya_code=code,
+            )
+            load_market_observations.clear()
+            st.success(tr("Observation saved."))
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+
+    st.markdown(f"#### {tr('Import CSV / Excel')}")
+    uploaded = st.file_uploader(tr("Upload a CSV or Excel file"), type=["csv", "xlsx", "xls"])
+    if uploaded is not None:
+        try:
+            frame = data_import.read_uploaded_file(uploaded.name, uploaded.getvalue())
+            valid, issues, duplicates = data_import.normalize_frame(frame)
+            st.caption(f"{tr('Valid rows')}: {len(valid)} · {tr('Duplicate rows within file: {count}', count=duplicates)}")
+            if valid:
+                st.dataframe(pd.DataFrame(valid).head(20), hide_index=True, use_container_width=True)
+            for issue in issues[:20]:
+                st.warning(issue)
+            if st.button(tr("Import observations"), disabled=not valid, key="import_observations"):
+                result = data_import.import_frame(frame)
+                load_market_observations.clear()
+                st.success(tr("Import complete: {inserted} added, {updated} updated, {skipped} skipped.", **result))
+                if result["issues"]:
+                    st.warning("\n".join(result["issues"][:20]))
+                st.rerun()
+        except (ValueError, ImportError) as error:
+            st.error(str(error))
+
+    st.markdown(f"#### {tr('Data sources')}")
+    sources = db.list_data_sources()
+    st.dataframe(sources, hide_index=True, use_container_width=True)
+    if not products.empty:
+        st.markdown(f"#### {tr('Product catalog')}")
+        st.dataframe(products.rename(columns={"product_name": tr("Product"), "category_name": tr("Category"), "unit": tr("Unit"), "is_active": tr("Active")}), hide_index=True, use_container_width=True)
+
+
+def _render_scenario(data, product, region):
+    st.subheader(tr("Hypothetical scenario simulator"))
+    product_names = sorted(data["product"].dropna().unique()) if not data.empty else []
+    if product == "All":
+        product = st.selectbox(tr("Product"), product_names or ["Potato"], key="scenario_product")
+    product_data = data[data["product"] == product] if not data.empty else pd.DataFrame()
+    if product_data.empty:
+        st.info(tr("No observations match the selected filters."))
+        return
+    if region == "All regions":
+        available_regions = sorted(product_data["region"].dropna().astype(str).unique())
+        region = st.selectbox(tr("Region"), available_regions, key="scenario_region") if available_regions else None
+    region_data = product_data[product_data["region"].astype(str) == str(region)]
+    latest = _latest_by_region(region_data)
+    if latest.empty:
+        st.info(tr("No observations match the selected filters."))
+        return
+    baseline = latest.iloc[0]
+    if pd.isna(baseline["price"]) and pd.isna(baseline["quantity"]):
+        st.info(tr("No price data available."))
+        return
+    st.caption(f"{tr('Latest observation')}: {baseline['date'].date()} · {baseline['data_quality']}")
+    with st.form("scenario_form"):
+        c1, c2, c3 = st.columns(3)
+        production = c1.number_input(tr("Production change (%)"), min_value=-100.0, max_value=500.0, value=0.0, step=5.0)
+        demand = c2.number_input(tr("Demand change (%)"), min_value=-100.0, max_value=500.0, value=0.0, step=5.0)
+        delay = c3.number_input(tr("Distribution delay (days)"), min_value=0, max_value=365, value=0, step=1)
+        c4, c5 = st.columns(2)
+        stock_change = c4.number_input(tr("Stock change (%)"), min_value=-100.0, max_value=500.0, value=0.0, step=5.0)
+        transport = c5.number_input(tr("Transportation cost change (%)"), min_value=-100.0, max_value=500.0, value=0.0, step=5.0)
+        submitted = st.form_submit_button(tr("Run hypothetical scenario"))
+    st.info(tr("Hypothetical sensitivity estimate only — not a prediction or causal claim."))
+    if submitted:
+        try:
+            result = market_intelligence.simulate_scenario(
+                None if pd.isna(baseline["price"]) else float(baseline["price"]),
+                None if pd.isna(baseline["quantity"]) else float(baseline["quantity"]),
+                production, demand, int(delay), stock_change, transport,
+            )
+            db.save_scenario_run("MARKET_SENSITIVITY", result["assumptions"], result)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(tr("Hypothetical price"), f"{result['scenario_price']:,.2f} DZD" if result["scenario_price"] is not None else "—", f"{result['price_index_pct']:+.1f}%")
+            c2.metric(tr("Hypothetical supply index change"), f"{result['scenario_stock_index_pct']:+.1f}%")
+            c3.metric(tr("Hypothetical risk"), tr(result["hypothetical_risk"]))
+            c4.metric(tr("Latest observation"), str(baseline["date"].date()))
+            st.json(result["assumptions"])
+        except ValueError as error:
+            st.error(str(error))
+
+
+def _render_reports(all_data):
+    st.subheader(tr("Report and export"))
+    if all_data.empty:
+        st.info(tr("No observations match the selected filters."))
+        return
+    last_observation = pd.to_datetime(all_data["date"]).max().date()
+    period = st.selectbox(tr("Reporting period"), ["Weekly", "Monthly", "Custom"])
+    default_start = last_observation - pd.Timedelta(days=6 if period == "Weekly" else 29 if period == "Monthly" else 30)
+    default_start = max(default_start, pd.to_datetime(all_data["date"]).min().date())
+    if period == "Custom":
+        c1, c2 = st.columns(2)
+        start = c1.date_input(tr("Start date"), value=default_start)
+        end = c2.date_input(tr("End date"), value=last_observation)
+    else:
+        start, end = default_start, last_observation
+        st.caption(f"{tr('Start date')}: {start} · {tr('End date')}: {end}")
+    if start > end:
+        st.error("Start date must be on or before end date.")
+        return
+    category_options = ["All"] + sorted(all_data["category"].dropna().astype(str).unique())
+    report_category = st.selectbox(tr("Category"), category_options, key="report_category")
+    candidates = all_data if report_category == "All" else all_data[all_data["category"] == report_category]
+    products = st.multiselect(tr("Products to compare"), sorted(candidates["product"].dropna().astype(str).unique()), default=sorted(candidates["product"].dropna().astype(str).unique())[:3])
+    regions = st.multiselect(tr("Regions to compare"), sorted(candidates["region"].dropna().astype(str).unique()), default=sorted(candidates["region"].dropna().astype(str).unique())[:6])
+    report_data = reporting.filter_period(candidates, start, end)
+    if products:
+        report_data = report_data[report_data["product"].isin(products)]
+    if regions:
+        report_data = report_data[report_data["region"].isin(regions)]
+    alerts = market_intelligence.detect_shortage_risks(report_data)
+    st.caption(f"{len(report_data)} {tr('observations')} · {tr('Data source and observation dates are included in downloads.')}")
+    if not report_data.empty and report_data["price"].notna().any():
+        for dimension in ("product", "region"):
+            comparison = reporting.comparison_series(report_data, dimension)
+            if comparison[dimension].nunique() > 1:
+                st.markdown(f"#### {tr('Comparison by product' if dimension == 'product' else 'Comparison by region')}")
+                st.plotly_chart(
+                    style_chart(
+                        px.line(
+                            comparison,
+                            x="date",
+                            y="price",
+                            color=dimension,
+                            facet_col="unit" if comparison["unit"].nunique(dropna=False) > 1 else None,
+                            labels={
+                                "date": tr("Date"),
+                                "price": tr("Price per unit"),
+                                dimension: tr("Product" if dimension == "product" else "Region"),
+                                "unit": tr("Unit"),
+                            },
+                        )
+                    ),
+                    use_container_width=True,
+                )
+    st.dataframe(report_data.head(500), hide_index=True, use_container_width=True)
+    csv = reporting.to_csv_bytes(report_data)
+    st.download_button(tr("Download CSV"), csv, file_name="agri-smart-market-report.csv", mime="text/csv")
+    excel = reporting.to_excel_bytes([("Market observations", report_data), ("Risk alerts", alerts)])
+    st.download_button(tr("Download Excel"), excel, file_name="agri-smart-market-report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(tr("Download PDF report"), reporting.to_pdf_bytes("AGRI-SMART DZ market report", report_data, alerts, start, end), file_name="agri-smart-market-report.pdf", mime="application/pdf")
+    st.download_button(tr("Download alerts CSV"), reporting.to_csv_bytes(alerts), file_name="agri-smart-alerts.csv", mime="text/csv", disabled=alerts.empty)
+
+
+def _render_classic_potato():
+    st.subheader(tr("Potato demo (classic)"))
+    clean = load_dashboard_data()
+    options = dict(NAVIGATION_SECTIONS)
+    section = st.selectbox(tr("Navigation"), list(options), format_func=lambda key: tr(options[key]), key="classic_potato_section")
+    snapshot, is_scenario = select_snapshot(clean)
+    alerts = build_alerts(snapshot)
+    anomalies = detect_anomalies(snapshot) if section in {"dashboard", "anomaly_detection"} else pd.DataFrame()
+    snapshot_date = snapshot["date"].max()
+    if is_scenario and snapshot_date >= SCENARIO_DATE:
+        st.info(tr("Demo scenario: July 2026 market pressure — price pressure in Alger, stock decline in Oran, and combined pressure in Constantine."))
+    if section == "dashboard":
+        render_kpis(snapshot, alerts, anomalies, snapshot_date)
+        render_dashboard_charts(snapshot)
+    elif section == "price_prediction":
+        render_price_prediction(get_model_predictions(clean), clean)
+    elif section == "stock_monitoring":
+        render_stock_monitoring(snapshot)
+    elif section in {"shortage_detection", "smart_alerts"}:
+        render_shortage_detection(alerts)
+    elif section == "anomaly_detection":
+        render_anomaly_detection(anomalies)
+    elif section == "regional_analysis":
+        render_regional_market(snapshot)
+    elif section == "what_if":
+        render_scenario_simulator(clean, get_model_predictions(clean))
+    elif section == "reports":
+        render_reports(clean, alerts)
+    elif section == "about":
+        render_about(clean)
+
+
 def main():
     select_language()
     apply_visual_theme()
-    section = select_section()
     ensure_demo_data()
-    clean_df = load_dashboard_data()
-    snapshot_df, is_scenario = select_snapshot(clean_df)
-    alert_df = build_alerts(snapshot_df)
-    anomalies_df = (
-        detect_anomalies(snapshot_df)
-        if section in {"dashboard", "anomaly_detection"}
-        else pd.DataFrame()
-    )
-    snapshot_date = snapshot_df["date"].max()
-
+    all_data = load_market_observations()
+    products = db.list_products()
+    wilayas = db.list_wilayas()
     st.title("AGRI-SMART DZ")
-    st.caption(tr("AI-powered agricultural market intelligence for Algeria · Focus product: Potato"))
-    st.caption(tr("All data in this demo is synthetic and clearly labeled as such; it is not a real Algerian market dataset."))
-    if is_scenario:
-        if snapshot_date < SCENARIO_DATE:
-            st.warning(tr(
-                "The dataset does not reach {date}; showing the latest available observations instead.",
-                date=f"{SCENARIO_DATE:%d %b %Y}",
-            ))
-        else:
-            st.info(tr("Demo scenario: July 2026 market pressure — price pressure in Alger, stock decline in Oran, and combined pressure in Constantine."))
+    st.caption(tr("AGRI-SMART DZ · Agricultural Market Intelligence for Algeria"))
 
     with st.sidebar:
-        st.header(tr("Controls"))
-        st.write(tr("Only the potato market is active in this MVP. The system is designed to extend to tomato, onion, and carrot markets later."))
-        st.info(tr("Important: the app flags unusual patterns for verification; it does not accuse a person or business of speculation."))
-        if st.button(tr("Refresh model training")):
-            for horizon in dp.HORIZONS:
-                train_and_evaluate(horizon, clean_df)
-            get_model_predictions.clear()
-            st.success(tr("Models retrained and saved."))
+        st.header(tr("Navigation"))
+        labels = dict(NEW_NAVIGATION)
+        page = st.radio(
+            tr("Navigation"),
+            list(labels),
+            format_func=lambda key: tr(labels[key]),
+            label_visibility="collapsed",
+        )
+        st.divider()
+        st.header(tr("Filters"))
+        categories = ["All"] + sorted(products["category_name"].dropna().astype(str).unique())
+        category = st.selectbox(tr("Category"), categories)
+        product_rows = products if category == "All" else products[products["category_name"] == category]
+        product_options = ["All"] + sorted(product_rows["product_name"].dropna().astype(str).unique())
+        product = st.selectbox(tr("Product"), product_options)
+        quality_options = ["All", *db.QUALITY_LEVELS]
+        quality = st.selectbox(tr("Data quality"), quality_options)
+        region_options = ["All regions"] + sorted(all_data["region"].dropna().astype(str).unique()) if not all_data.empty else ["All regions"]
+        region = st.selectbox(tr("Region"), region_options)
+        if not all_data.empty:
+            min_date = pd.to_datetime(all_data["date"]).min().date()
+            max_date = pd.to_datetime(all_data["date"]).max().date()
+            default_start = max(min_date, max_date - pd.Timedelta(days=365))
+            date_range = st.date_input(tr("Date range"), value=(default_start, max_date), min_value=min_date, max_value=max_date)
+        else:
+            date_range = ()
+    data = _selected_observations(all_data, product, category, region, date_range, quality)
+    if not data.empty and (data["data_quality"] == "SYNTHETIC_DEMO").any():
+        st.warning(tr("Synthetic Demonstration Data — Not Verified Market Data."))
+    elif not data.empty:
+        st.info(tr("Observed market data"))
+    if data.empty and page != "data_management":
+        st.info(tr("No observations match the selected filters."))
 
-    predictions = (
-        get_model_predictions(clean_df)
-        if section in {"price_prediction", "what_if"}
-        else None
-    )
-
-    if section == "dashboard":
-        render_kpis(snapshot_df, alert_df, anomalies_df, snapshot_date)
-        render_dashboard_charts(snapshot_df)
-    elif section == "price_prediction":
-        render_price_prediction(predictions, clean_df)
-    elif section == "stock_monitoring":
-        render_stock_monitoring(snapshot_df)
-    elif section == "shortage_detection":
-        render_shortage_detection(alert_df)
-    elif section == "anomaly_detection":
-        render_anomaly_detection(anomalies_df)
-    elif section == "regional_analysis":
-        render_regional_market(snapshot_df)
-    elif section == "what_if":
-        render_scenario_simulator(clean_df, predictions)
-    elif section == "smart_alerts":
-        render_smart_alerts(alert_df)
-    elif section == "reports":
-        render_reports(clean_df, alert_df)
-    elif section == "about":
-        render_about(clean_df)
-
-    if section == "dashboard":
-        with st.expander(tr("Recent product dataset preview")):
-            preview = snapshot_df.tail(10).rename(columns={column: tr(column) for column in snapshot_df.columns})
-            region_column = tr("region")
-            preview[region_column] = preview[region_column].map(region_label)
-            st.dataframe(preview, use_container_width=True)
+    if page == "market_dashboard":
+        _render_dashboard(data)
+    elif page == "algeria_map":
+        _render_algeria_map(data, all_data, wilayas)
+    elif page == "multi_forecast":
+        _render_forecast(data, product)
+    elif page == "early_warnings":
+        _render_early_warnings(data)
+    elif page == "data_management":
+        _render_data_management(products, wilayas)
+    elif page == "scenario_simulation":
+        _render_scenario(data, product, region)
+    elif page == "market_reports":
+        _render_reports(all_data)
+    elif page == "potato_classic":
+        _render_classic_potato()
 
 
 if __name__ == "__main__":
